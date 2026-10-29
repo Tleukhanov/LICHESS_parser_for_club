@@ -9,6 +9,8 @@ const SEND_LABELS = {
   sent: "Отправлено",
   skipped_400: "Отклонено Lichess",
   skipped_429: "Лимит Lichess",
+  skipped_joined: "Уже в клубе",
+  sending: "Отправляется",
   failed: "Ошибка",
   rate_limited: "Лимит Lichess",
   error: "Ошибка",
@@ -28,6 +30,22 @@ const REACTION_LABELS = {
   declined: "Отказался",
   spam_report: "Жалоба на спам",
 };
+
+const REFUSAL_LABELS = {
+  daily_limit: "Дневной лимит отправок исчерпан",
+  cooldown: "Отправка приостановлена после лимита Lichess",
+  too_soon: "Слишком часто — подождите немного",
+  joined: "Игрок уже вступил в клуб",
+  already_sent: "Этому игроку уже писали",
+  empty_text: "Текст приглашения пустой",
+  in_progress: "Отправка уже выполняется",
+};
+
+function humanizeError(message) {
+  const match = /^send refused: (.+)$/.exec(String(message));
+  if (match) return REFUSAL_LABELS[match[1]] || match[1];
+  return message;
+}
 
 let toastTimer = null;
 
@@ -117,7 +135,8 @@ function showToast(message, isError = false) {
 }
 
 function reportError(error) {
-  showToast(error && error.message ? error.message : String(error), true);
+  const message = error && error.message ? error.message : String(error);
+  showToast(humanizeError(message), true);
 }
 
 async function runAction(trigger, action) {
@@ -276,6 +295,7 @@ function reviewCard(row) {
 
   approveBtn.addEventListener("click", () =>
     runAction(approveBtn, async () => {
+      if (!window.confirm(`Отправить приглашение игроку ${row.nick}?`)) return;
       const outreachId = await ensureOutreach();
       await api(`/outreach/${outreachId}`, {
         method: "PATCH",
@@ -335,7 +355,7 @@ async function loadReview() {
     const rows = await api("/candidates");
     const visible = rows.filter((row) => {
       const draft = row.latest_outreach;
-      return !draft || draft.send_status !== "sent";
+      return row.status !== "joined" && (!draft || draft.send_status !== "sent");
     });
 
     if (visible.length === 0) {
@@ -408,7 +428,7 @@ async function loadSent() {
   const list = $("sent-list");
   list.replaceChildren(el("p", "empty", "Загрузка…"));
   try {
-    const rows = await api("/outreach");
+    const rows = await api("/outreach?send_status=sent");
     // Newest first is more useful on a phone.
     rows.reverse();
     if (rows.length === 0) {

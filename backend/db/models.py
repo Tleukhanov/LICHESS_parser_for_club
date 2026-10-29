@@ -23,9 +23,11 @@ SEND_STATUSES = {
     "draft",
     "approved",
     "rejected",
+    "sending",
     "sent",
     "skipped_400",
     "skipped_429",
+    "skipped_joined",
     "failed",
 }
 REACTIONS = {"none", "replied", "declined", "spam_report"}
@@ -40,7 +42,7 @@ candidates = Table(
     Column("blitz", Integer, nullable=True),
     Column("bullet", Integer, nullable=True),
     Column("games_total", Integer, nullable=False, default=0),
-    # Unix timestamp (seconds) of the last time the player was seen in the club.
+    # Lichess ``seenAt`` value in Unix milliseconds (see users.fetch_perfs).
     Column("last_seen", BigInteger, nullable=True),
     Column("status", String(20), nullable=False, default="new"),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
@@ -68,3 +70,12 @@ outreach = Table(
 
 Index("ix_outreach_candidate_id", outreach.c.candidate_id)
 Index("ix_outreach_send_status", outreach.c.send_status)
+
+#: Tiny key/value store for cross-request state such as the 429 cooldown.
+app_state = Table(
+    "app_state",
+    metadata,
+    Column("key", String(50), primary_key=True),
+    Column("value", Text, nullable=True),
+    Column("updated_at", DateTime, nullable=False, server_default=func.now()),
+)

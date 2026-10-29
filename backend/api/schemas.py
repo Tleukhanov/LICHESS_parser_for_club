@@ -1,12 +1,21 @@
 """Request models of the admin API (Pydantic v2)."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ParseRequest(BaseModel):
     """Filters for a Lichess club parse run."""
 
-    club_id: str
+    club_id: str = Field(min_length=1)
+
+    @field_validator("club_id")
+    @classmethod
+    def _strip_club_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("club_id must not be blank")
+        return stripped
+
     min_rapid: int | None = None
     max_rapid: int | None = None
     min_games: int = 0

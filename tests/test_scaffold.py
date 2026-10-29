@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from backend.db import database as database_module
 from backend.db.database import build_engine, init_db
-from backend.db.models import candidates, metadata, outreach
+from backend.db.models import app_state, candidates, metadata, outreach
 from backend.db.repository import (
     create_candidate,
     create_outreach,
@@ -110,4 +110,8 @@ def test_health_endpoint(tmp_path, monkeypatch) -> None:
 
 
 def test_metadata_has_no_extra_tables() -> None:
-    assert set(metadata.tables) == {candidates.name, outreach.name}
+    assert set(metadata.tables) == {
+        candidates.name,
+        outreach.name,
+        app_state.name,
+    }

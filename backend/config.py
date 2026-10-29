@@ -27,6 +27,11 @@ class Settings(BaseSettings):
 
     send_interval_seconds: int = 45
     daily_send_limit: int = 30
+    # Safety pause after a 429. This is our own conservative value, not an
+    # official Lichess limit (the platform does not publish exact numbers).
+    rate_limit_cooldown_seconds: int = 900
+    # A ``sending`` row older than this is considered abandoned and is retried.
+    stale_sending_seconds: int = 600
     min_rapid: int = 0
     max_rapid: int = 9999
 

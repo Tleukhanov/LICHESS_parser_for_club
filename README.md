@@ -149,11 +149,13 @@ Every key of `backend/config.py` is listed in `.env.example`.
 | `MESSAGE_LANGUAGE` | `ru` | Language of generated and fallback messages (ISO 639-1). The prompt knows `en`, `ru`, `uk`, `be`, `kk`, `de`, `fr`, `es`, `it`, `pt`, `pl`, `tr`, `nl`, `cs`, `sv`; the offline fallback has `ru` and `en` texts and uses `en` for anything else. |
 | `CLUB_URL` | empty | Link inserted into messages. When empty it is derived as `https://lichess.org/team/<SENPAI_TEAM_ID>`. |
 | `DATABASE_URL` | `sqlite:///./data/outreach.db` | SQLAlchemy URL. A Heroku-style `postgres://` prefix is rewritten to `postgresql://`. |
-| `SEND_INTERVAL_SECONDS` | `45` | Pause between two outgoing direct messages in a batch. |
-| `DAILY_SEND_LIMIT` | `30` | Maximum messages per UTC day; checked against `outreach.sent_at`. |
+| `SEND_INTERVAL_SECONDS` | `45` | Minimum gap between two direct messages. Enforced by the batch loop and by the web UI's single-send endpoint (a too-early click is refused instead of sent). |
+| `DAILY_SEND_LIMIT` | `30` | Maximum messages per UTC day; checked against `outreach.sent_at` on **every** send path (web UI, single CLI and batch). |
+| `RATE_LIMIT_COOLDOWN_SECONDS` | `900` | Our own safety pause after a `429`. This is not an official Lichess number; the platform does not publish one. |
+| `STALE_SENDING_SECONDS` | `600` | A `sending` row older than this is considered abandoned and is retried by the next batch. |
 | `MIN_RAPID` | `0` | Declared default lower rating bound. The parse form/API currently passes its own `min_rapid`, so this value is not applied automatically. |
 | `MAX_RAPID` | `9999` | Declared default upper rating bound; same note as `MIN_RAPID`. |
-| `ADMIN_TOKEN` | empty | Protects `/api/*`. Accepted as the `X-Admin-Token` header or a `?token=` query parameter. When empty, every request is allowed (local development only). |
+| `ADMIN_TOKEN` | empty | Protects `/api/*`. Send it in the `X-Admin-Token` header only (the UI stores it in `localStorage`). Query-string tokens are rejected. When empty, every request is allowed (local development only). |
 
 `.env` is git-ignored. Never commit real tokens.
 
@@ -180,9 +182,12 @@ Create a personal API token at <https://lichess.org/account/oauth/token> with:
 
 Lichess does **not** publish an exact rate limit for private messages. This tool
 therefore does not guess one: it uses the conservative `SEND_INTERVAL_SECONDS`
-interval (default 45 s) plus `DAILY_SEND_LIMIT` (default 30 messages per UTC day), and
-stops the whole batch when the API answers `429`. Read responses are retried with
-back-off, honouring `Retry-After` when present.
+interval (default 45 s) plus `DAILY_SEND_LIMIT` (default 30 messages per UTC day).
+The guards live in `backend/sender/queue.py::send_outreach`, so they apply to the web
+UI button, `--outreach-id` and `--batch` alike. A `429` also stores a cooldown
+(`RATE_LIMIT_COOLDOWN_SECONDS`, default 15 min) that blocks every send path until it
+expires. Read responses are retried with back-off, honouring `Retry-After` when
+present.
 
 ## Behavior notes for sending
 
@@ -193,7 +198,7 @@ result, and `backend/sender/queue.py` persists it:
 | --- | --- | --- | --- |
 | 2xx | `SENT` | `sent` | `sent_at` is stored, the candidate becomes `messaged`, the daily counter grows. |
 | 400 | `REJECTED` | `skipped_400` | Message rejected by Lichess (blocked user, friends-only messages, etc.). Recorded with the response body in `send_error`; the batch continues. |
-| 429 | `RATE_LIMITED` | `skipped_429` | Recorded, and the rest of the batch stops; remaining `approved` rows stay approved for a later run. |
+| 429 | `RATE_LIMITED` | `skipped_429` | Recorded, a cooldown is stored, and the rest of the batch stops; remaining `approved` rows stay approved for a later run. |
 | other 4xx/5xx or network error | `ERROR` | `failed` | Recorded with the error text. |
 
 A `400` is never treated as a crash: it is a normal, expected outcome for some users
@@ -201,8 +206,18 @@ and is stored so the same person is not retried automatically. Failed and skippe
 never re-enter the queue by themselves; approve or regenerate explicitly if you want
 another attempt.
 
-Sending is idempotent per row: a row that is already `sent` is a no-op, and only
-`approved` rows are selected by a batch.
+Safety rules enforced before any HTTP request:
+
+- the daily cap and the `429` cooldown are checked on every send path;
+- a second message to the same player is refused (only one successful DM per nick);
+- a candidate already marked `joined` is skipped (`skipped_joined`);
+- empty message text is refused;
+- a row is atomically claimed (`approved` → `sending`) before the request, so a double
+  submit cannot send the same DM twice; `sent` rows are immutable history.
+
+Only `approved` rows are selected by a batch. `approve`/`reject` refuse to move a
+`sent` row, and `PATCH` refuses to change the text of a sent message (reactions and
+reviewer fields are still editable).
 
 ## Human review workflow
 
@@ -233,24 +248,25 @@ All `/api/*` routes require the admin token unless `ADMIN_TOKEN` is empty.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness probe: `{"status": "ok"}`. |
-| `GET` | `/api/stats` | Dashboard counters: candidate totals by status, outreach totals by send status, `sent_total`, `joined_total`, `conversion_rate`. |
+| `GET` | `/api/stats` | Dashboard counters: candidate totals by status, outreach totals by send status, `sent_total`, `joined_total`, `conversion_rate`. Sent/joined totals count **distinct candidates** and match the CLI (`conversion_stats`). |
 | `GET` | `/api/candidates` | List candidates ordered by id, each with its latest outreach row. Optional filters: `status`, `source_club_id`. |
 | `POST` | `/api/parse` | Parse a club. Body: `club_id` (required), `min_rapid`, `max_rapid`, `min_games` (default 0), `limit`, `exclude_own` (default `true`, excludes `SENPAI_TEAM_ID` members). Returns `{"parsed": n, "candidates": [...]}`. |
 | `POST` | `/api/outreach/generate` | Generate a draft for `candidate_id`; reuses/updates the latest `draft` row. Returns the outreach row. `404` if the candidate is unknown. |
 | `GET` | `/api/outreach` | List outreach rows joined with nick and ratings. Optional filter: `send_status`. |
-| `PATCH` | `/api/outreach/{outreach_id}` | Update `message_text`, `reviewer_rating` (1–5), `reviewer_notes`, `reaction`. `422` on an unknown reaction, `404` if missing. |
-| `POST` | `/api/outreach/{outreach_id}/approve` | Set `send_status = approved`. |
-| `POST` | `/api/outreach/{outreach_id}/reject` | Set `send_status = rejected`. |
-| `POST` | `/api/outreach/{outreach_id}/send` | Send one row. An untouched `draft` is approved on the fly; any status other than `draft`/`approved` (for example `rejected` or `sent`) returns `400`. Returns the send status, error and the updated row. |
-| `POST` | `/api/analytics/refresh` | Re-read the target team and mark joined candidates. Returns `team_id`, `checked`, `newly_joined`, `total_joined`. |
+| `PATCH` | `/api/outreach/{outreach_id}` | Update `message_text`, `reviewer_rating` (1–5), `reviewer_notes`, `reaction`. `422` on an unknown reaction, `404` if missing, `409` when changing the text of a `sent` row (it is immutable history; reactions/notes stay editable). |
+| `POST` | `/api/outreach/{outreach_id}/approve` | Move `draft`/`failed`/`rejected`/`skipped_*` to `approved`. `409` for `sent`/`sending`. |
+| `POST` | `/api/outreach/{outreach_id}/reject` | Move a non-sent row to `rejected`. `409` for `sent`/`sending`. |
+| `POST` | `/api/outreach/{outreach_id}/send` | Send one row through the same guards as the CLI. An untouched `draft` is approved on the fly; any other non-`approved` status returns `400`. `429` when the daily cap, pacing or the `429` cooldown refuses the send; `409` for `sent`/`sending`/already-messaged/joined; `422` for empty text. |
+| `POST` | `/api/analytics/refresh` | Re-read the target team and mark joined candidates. Returns `team_id`, `checked` (members seen in the team), `newly_joined` (candidate status changed) and `total_joined` (candidates with a **sent** message that are now in the team). `400` when `SENPAI_TEAM_ID` is empty. |
 | `GET` | `/api/analytics/export.csv` | Download the dataset as `text/csv` (`dataset.csv`). |
 
 Static files (`/`, `/app.js`, `/style.css`) are served from `frontend/`.
 
 ## Data model
 
-Two SQLAlchemy Core tables (`backend/db/models.py`), dialect-neutral so the same schema
-works on SQLite and Postgres. Allowed values are enforced in the application layer.
+Three SQLAlchemy Core tables (`backend/db/models.py`), dialect-neutral so the same
+schema works on SQLite and Postgres. Allowed values are enforced in the application
+layer. `app_state` is a tiny key/value store used for the `429` cooldown.
 
 **`candidates`**
 
@@ -277,11 +293,11 @@ Re-parsing a club updates ratings and `last_seen` but leaves `status` untouched.
 | `llm_model` | string(100) | Model name, or `fallback` when the template was used. |
 | `reviewer_rating` | integer | 1–5, optional. |
 | `reviewer_notes` | text | Optional. |
-| `send_status` | string(20) | `draft`, `approved`, `rejected`, `sent`, `skipped_400`, `skipped_429`, `failed` (default `draft`, indexed). |
+| `send_status` | string(20) | `draft`, `approved`, `sending` (transient claim), `rejected`, `sent`, `skipped_400`, `skipped_429`, `skipped_joined`, `failed` (default `draft`, indexed). |
 | `send_error` | text | Response body/error of a failed attempt. |
 | `sent_at` | datetime | Set on success; used by the daily cap. |
 | `reaction` | string(20) | `none`, `replied`, `declined`, `spam_report` (default `none`). |
-| `joined` | boolean | Set by the analytics refresh. |
+| `joined` | boolean | Set by the analytics refresh only for rows that were actually `sent`, so drafts do not inflate conversion. |
 | `joined_at` | datetime | |
 | `created_at`, `updated_at` | datetime | |
 
@@ -297,7 +313,9 @@ joined_at
 ```
 
 Empty values are written as empty strings, booleans as `true`/`false`, timestamps in
-ISO format with a space separator.
+ISO format with a space separator. String values that start with `=`, `+`, `-`, `@`,
+a tab or a carriage return are prefixed with `'` to neutralize CSV formula injection
+when the file is opened in a spreadsheet.
 
 ## Deployment on Heroku
 
@@ -350,8 +368,9 @@ personalized, human-approved outreach:
 - every message is written for one specific player and approved by a person;
 - only users who are already members of a related club are targeted;
 - one message per player, no automatic retries after a rejection;
-- the default pacing is 45 seconds between messages and 30 messages per day;
-- `429` stops the batch immediately.
+- the default pacing is 45 seconds between messages and 30 messages per day, enforced
+  on the web UI path as well as the CLI;
+- a `429` stops the batch immediately and starts a 15-minute cooldown for all paths.
 
 Keep the defaults or make them slower, and respect anyone who does not want to be
 contacted. You are responsible for how you use your Lichess account.

@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import insert, select, update
 from sqlalchemy.orm import Session
 
-from backend.db.models import candidates, outreach
+from backend.db.models import app_state, candidates, outreach
 
 
 def _utcnow() -> datetime:
@@ -116,6 +116,40 @@ def list_outreach(
     if send_status is not None:
         stmt = stmt.where(outreach.c.send_status == send_status)
     return [dict(row._mapping) for row in session.execute(stmt).all()]
+
+
+def has_sent_outreach(
+    session: Session, candidate_id: int, exclude_id: int | None = None
+) -> bool:
+    """Return True when the candidate already has a successfully sent message."""
+    stmt = select(outreach.c.id).where(
+        outreach.c.candidate_id == candidate_id,
+        outreach.c.send_status == "sent",
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(outreach.c.id != exclude_id)
+    return session.execute(stmt.limit(1)).first() is not None
+
+
+def get_state(session: Session, key: str) -> str | None:
+    """Read a value from the small ``app_state`` key/value store."""
+    return session.execute(
+        select(app_state.c.value).where(app_state.c.key == key)
+    ).scalar_one_or_none()
+
+
+def set_state(session: Session, key: str, value: str | None) -> None:
+    """Insert or update a key in the ``app_state`` store."""
+    updated = session.execute(
+        update(app_state)
+        .where(app_state.c.key == key)
+        .values(value=value, updated_at=_utcnow())
+    )
+    if updated.rowcount == 0:
+        session.execute(
+            insert(app_state).values(key=key, value=value, updated_at=_utcnow())
+        )
+    session.commit()
 
 
 def update_outreach(

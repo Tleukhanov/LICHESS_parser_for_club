@@ -73,6 +73,7 @@ def test_refresh_joined_marks_matching_candidates_case_insensitively(
 
     alice_id = create_candidate(db_session, nick="Alice")
     first = create_outreach(db_session, alice_id, "First")
+    update_outreach(db_session, first, send_status="sent")
     second = create_outreach(db_session, alice_id, "Second")
     bob_id = create_candidate(db_session, nick="Bob")
     bob_outreach = create_outreach(db_session, bob_id, "Hi Bob")
@@ -98,10 +99,12 @@ def test_refresh_joined_marks_matching_candidates_case_insensitively(
         "total_joined": 1,
     }
 
-    for outreach_id in (first, second):
-        row = get_outreach(db_session, outreach_id)
-        assert row["joined"] is True
-        assert row["joined_at"] == MOMENT
+    # Only the message that was actually sent counts as converted.
+    sent_row = get_outreach(db_session, first)
+    assert sent_row["joined"] is True
+    assert sent_row["joined_at"] == MOMENT
+    assert get_outreach(db_session, second)["joined"] is False
+    assert get_outreach(db_session, second)["joined_at"] is None
 
     assert get_outreach(db_session, bob_outreach)["joined"] is False
     assert get_candidate(db_session, alice_id)["status"] == "joined"
@@ -158,9 +161,10 @@ def test_conversion_stats_counts_and_rate(db_session: Session) -> None:
     stats = conversion.conversion_stats(db_session)
 
     assert stats["outreach_total"] == 4
-    assert stats["sent_total"] == 3
+    # Conversion is per player, not per outreach row.
+    assert stats["sent_total"] == 2
     assert stats["joined_total"] == 1
-    assert stats["conversion_rate"] == round(1 / 3, 4)
+    assert stats["conversion_rate"] == 0.5
     assert stats["by_send_status"]["sent"] == 3
     assert stats["by_send_status"]["draft"] == 1
     assert stats["by_reaction"]["replied"] == 2

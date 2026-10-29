@@ -161,7 +161,9 @@ def _extract_content(response: Any) -> str:
             getattr(response, "status_code", 0),
             "empty message content in LLM response",
         )
-    return content.strip()
+    # Keep the stored message within the advertised limit even if the model
+    # ignores the prompt.
+    return content.strip()[:MAX_MESSAGE_CHARS].rstrip()
 
 
 def _resolve_club_url(club_url: str | None) -> str:

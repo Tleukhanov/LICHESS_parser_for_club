@@ -96,52 +96,46 @@ def refresh_joined(
     )
 
     candidate_rows = db_session.execute(select(candidates)).all()
-    joined_candidate_ids = set(
-        db_session.execute(
-            select(outreach.c.candidate_id).where(outreach.c.joined.is_(True))
-        ).scalars()
-    )
 
     newly_joined = 0
     for candidate in candidate_rows:
         if candidate.nick.lower() not in members:
             continue
 
-        already_joined = (
-            candidate.status == "joined"
-            or candidate.id in joined_candidate_ids
-        )
-        if not already_joined:
-            newly_joined += 1
-
-        db_session.execute(
-            update(outreach)
-            .where(
-                outreach.c.candidate_id == candidate.id,
-                outreach.c.joined.is_(False),
-            )
-            .values(joined=True, joined_at=timestamp, updated_at=timestamp)
-        )
         if candidate.status != "joined":
+            newly_joined += 1
             db_session.execute(
                 update(candidates)
                 .where(candidates.c.id == candidate.id)
                 .values(status="joined", updated_at=timestamp)
             )
 
+        # Only messages that were actually sent count towards conversion: a
+        # draft or a rejected message must not look like a successful invite.
+        db_session.execute(
+            update(outreach)
+            .where(
+                outreach.c.candidate_id == candidate.id,
+                outreach.c.send_status == "sent",
+                outreach.c.joined.is_(False),
+            )
+            .values(joined=True, joined_at=timestamp, updated_at=timestamp)
+        )
+
     db_session.commit()
 
     total_joined = int(
         db_session.execute(
             select(func.count(func.distinct(outreach.c.candidate_id))).where(
-                outreach.c.joined.is_(True)
+                outreach.c.joined.is_(True),
+                outreach.c.send_status == "sent",
             )
         ).scalar_one()
     )
 
     return {
         "team_id": resolved_team_id,
-        "checked": len(candidate_rows),
+        "checked": len(members),
         "newly_joined": newly_joined,
         "total_joined": total_joined,
     }
@@ -158,14 +152,15 @@ def conversion_stats(db_session: Session) -> dict[str, Any]:
     )
     sent_total = _count_rows(
         db_session,
-        select(func.count())
-        .select_from(outreach)
-        .where(outreach.c.send_status == "sent"),
+        select(func.count(func.distinct(outreach.c.candidate_id))).where(
+            outreach.c.send_status == "sent"
+        ),
     )
     joined_total = _count_rows(
         db_session,
         select(func.count(func.distinct(outreach.c.candidate_id))).where(
-            outreach.c.joined.is_(True)
+            outreach.c.joined.is_(True),
+            outreach.c.send_status == "sent",
         ),
     )
 
@@ -233,6 +228,10 @@ def _dataset_rows(db_session: Session) -> list[list[Any]]:
     return rows
 
 
+#: Leading characters that spreadsheet apps treat as formulas.
+_CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _csv_value(value: Any) -> Any:
     if value is None:
         return ""
@@ -240,6 +239,9 @@ def _csv_value(value: Any) -> Any:
         return "true" if value else "false"
     if isinstance(value, datetime):
         return value.isoformat(sep=" ")
+    if isinstance(value, str) and value.startswith(_CSV_INJECTION_PREFIXES):
+        # Neutralize CSV formula injection when the dataset is opened in Excel.
+        return "'" + value
     return value
 
 

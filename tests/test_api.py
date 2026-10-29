@@ -5,6 +5,7 @@ tests never touch the network.
 """
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 import pytest
 import requests
@@ -19,11 +20,14 @@ from backend.db.database import build_engine, get_session, init_db
 from backend.db.repository import (
     create_candidate,
     create_outreach,
+    get_candidate,
     get_outreach,
     list_outreach,
     update_outreach,
 )
 from backend.lichess_api.messaging import SendResult, SendStatus
+from backend.lichess_api.transport import LichessError
+from backend.sender import queue
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +111,8 @@ def test_admin_token_is_required_when_configured(
     assert client.get("/api/stats").status_code == 401
     assert client.get("/api/stats", headers={"X-Admin-Token": "wrong"}).status_code == 401
     assert client.get("/api/stats", headers={"X-Admin-Token": "secret"}).status_code == 200
-    assert client.get("/api/stats?token=secret").status_code == 200
+    # Query-string tokens are intentionally rejected (they leak into logs).
+    assert client.get("/api/stats?token=secret").status_code == 401
     # The health check stays public even when the API is protected.
     assert client.get("/health").status_code == 200
 
@@ -419,13 +424,15 @@ def test_analytics_refresh_marks_team_members(
         "team_id": "senpai",
         "checked": 1,
         "newly_joined": 1,
-        "total_joined": 1,
+        "total_joined": 0,
     }
     assert api_session.closed is True
 
+    # The candidate is marked as joined, but a draft must not count as a
+    # converted invitation.
     row = get_outreach(db, outreach_id)
-    assert row["joined"] is True
-    assert row["joined_at"] is not None
+    assert row["joined"] is False
+    assert get_candidate(db, candidate_id)["status"] == "joined"
 
     second = client.post("/api/analytics/refresh")
     assert second.status_code == 200
@@ -451,3 +458,174 @@ def test_analytics_export_returns_csv_attachment(
     lines = response.text.splitlines()
     assert lines[0] == ",".join(conversion.DATASET_HEADER)
     assert "zoe" in response.text
+
+
+# ---------------------------------------------------------------------------
+# Sending through the API goes through the same safety guards as the CLI.
+# ---------------------------------------------------------------------------
+
+
+def _approved(db: Session, nick: str, text: str = "Hi") -> int:
+    candidate_id = create_candidate(db, nick=nick, games_total=5)
+    outreach_id = create_outreach(db, candidate_id, text)
+    update_outreach(db, outreach_id, send_status="approved")
+    return outreach_id
+
+
+def _sent_today(db: Session, nick: str) -> int:
+    candidate_id = create_candidate(db, nick=nick)
+    outreach_id = create_outreach(db, candidate_id, "old")
+    update_outreach(
+        db,
+        outreach_id,
+        send_status="sent",
+        sent_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    return outreach_id
+
+
+def _fake_sender(monkeypatch, result: SendResult) -> list[tuple]:
+    calls: list[tuple] = []
+
+    def fake_send_message(session, username, text):
+        calls.append((username, text))
+        return result
+
+    monkeypatch.setattr(queue, "build_session", lambda: FakeApiSession())
+    monkeypatch.setattr(queue, "send_message", fake_send_message)
+    return calls
+
+
+def test_send_route_uses_guarded_sender_and_records_sent(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    candidate_id = create_candidate(db, nick="erin")
+    outreach_id = create_outreach(db, candidate_id, "Hi")
+    calls = _fake_sender(monkeypatch, SendResult(SendStatus.SENT))
+
+    response = client.post(f"/api/outreach/{outreach_id}/send")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "sent"
+    assert response.json()["outreach"]["send_status"] == "sent"
+    assert calls == [("erin", "Hi")]
+
+
+def test_send_route_maps_rejected_to_skipped_400(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    outreach_id = _approved(db, "blocked")
+    calls = _fake_sender(
+        monkeypatch, SendResult(SendStatus.REJECTED, "the message was rejected")
+    )
+
+    response = client.post(f"/api/outreach/{outreach_id}/send")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "rejected"
+    assert response.json()["outreach"]["send_status"] == "skipped_400"
+    assert len(calls) == 1
+
+
+def test_send_route_rate_limit_blocks_the_next_send(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    first = _approved(db, "alice")
+    second = _approved(db, "bob")
+    calls = _fake_sender(
+        monkeypatch, SendResult(SendStatus.RATE_LIMITED, "slow down")
+    )
+
+    first_response = client.post(f"/api/outreach/{first}/send")
+    assert first_response.status_code == 200
+    assert first_response.json()["outreach"]["send_status"] == "skipped_429"
+
+    second_response = client.post(f"/api/outreach/{second}/send")
+    assert second_response.status_code == 429
+    assert len(calls) == 1
+
+
+def test_send_route_respects_daily_cap(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "daily_send_limit", 1)
+    _sent_today(db, "done")
+    outreach_id = _approved(db, "alice")
+    calls = _fake_sender(monkeypatch, SendResult(SendStatus.SENT))
+
+    response = client.post(f"/api/outreach/{outreach_id}/send")
+
+    assert response.status_code == 429
+    assert calls == []
+
+
+def test_send_route_rejects_empty_text(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    candidate_id = create_candidate(db, nick="empty")
+    outreach_id = create_outreach(db, candidate_id, "   ")
+    calls = _fake_sender(monkeypatch, SendResult(SendStatus.SENT))
+
+    response = client.post(f"/api/outreach/{outreach_id}/send")
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_approve_and_reject_sent_are_conflicts(
+    client: TestClient, db: Session
+) -> None:
+    outreach_id = _sent_today(db, "done")
+
+    assert client.post(f"/api/outreach/{outreach_id}/approve").status_code == 409
+    assert client.post(f"/api/outreach/{outreach_id}/reject").status_code == 409
+
+
+def test_sent_message_text_is_immutable_but_reaction_is_allowed(
+    client: TestClient, db: Session
+) -> None:
+    outreach_id = _sent_today(db, "done")
+
+    immutable = client.patch(
+        f"/api/outreach/{outreach_id}", json={"message_text": "new"}
+    )
+    assert immutable.status_code == 409
+
+    allowed = client.patch(
+        f"/api/outreach/{outreach_id}", json={"reaction": "replied"}
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["reaction"] == "replied"
+    assert get_outreach(db, outreach_id)["message_text"] == "old"
+
+
+def test_parse_rejects_blank_club_id(client: TestClient) -> None:
+    assert client.post("/api/parse", json={"club_id": ""}).status_code == 422
+    assert client.post("/api/parse", json={"club_id": "   "}).status_code == 422
+
+
+def test_parse_maps_lichess_error_to_502(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(routes, "build_session", lambda: FakeApiSession())
+
+    def boom(*args, **kwargs):
+        raise LichessError(404, "team not found", retryable=False)
+
+    monkeypatch.setattr(routes, "parse_and_store", boom)
+
+    response = client.post("/api/parse", json={"club_id": "nope"})
+
+    assert response.status_code == 502
+    assert "team not found" in response.json()["detail"]
+
+
+def test_analytics_refresh_without_team_returns_400(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "senpai_team_id", "")
+    monkeypatch.setattr(routes, "build_session", lambda: FakeApiSession())
+
+    response = client.post("/api/analytics/refresh")
+
+    assert response.status_code == 400
