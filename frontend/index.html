@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#12232e" />
+    <title>Клуб: рассылка приглашений</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Приглашения в клуб</h1>
+      <button type="button" id="token-open" class="ghost-button">Токен</button>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Разделы">
+      <button type="button" class="tab is-active" data-tab="parse" role="tab">Парсинг</button>
+      <button type="button" class="tab" data-tab="review" role="tab">Ревью</button>
+      <button type="button" class="tab" data-tab="sent" role="tab">Отправленные</button>
+      <button type="button" class="tab" data-tab="stats" role="tab">Статистика</button>
+    </nav>
+
+    <main>
+      <section id="tab-parse" class="tab-panel">
+        <h2>Парсинг клуба</h2>
+        <form id="parse-form" class="card form">
+          <label>
+            ID клуба
+            <input id="parse-club" name="club_id" type="text" required placeholder="например, senpai-chess" />
+          </label>
+          <div class="form-row">
+            <label>
+              Мин. rapid
+              <input id="parse-min-rapid" name="min_rapid" type="number" inputmode="numeric" min="0" placeholder="0" />
+            </label>
+            <label>
+              Макс. rapid
+              <input id="parse-max-rapid" name="max_rapid" type="number" inputmode="numeric" min="0" placeholder="9999" />
+            </label>
+          </div>
+          <div class="form-row">
+            <label>
+              Мин. партий
+              <input id="parse-min-games" name="min_games" type="number" inputmode="numeric" min="0" value="0" />
+            </label>
+            <label>
+              Лимит
+              <input id="parse-limit" name="limit" type="number" inputmode="numeric" min="1" placeholder="без лимита" />
+            </label>
+          </div>
+          <label class="checkbox">
+            <input id="parse-exclude-own" name="exclude_own" type="checkbox" checked />
+            Исключить участников своей команды
+          </label>
+          <button type="submit" class="primary-button">Парсить</button>
+        </form>
+        <p id="parse-status" class="status" role="status"></p>
+      </section>
+
+      <section id="tab-review" class="tab-panel is-hidden">
+        <h2>Ревью черновиков</h2>
+        <p class="hint">Проверьте текст, поставьте оценку и отправьте приглашение.</p>
+        <div id="review-list" class="cards"></div>
+      </section>
+
+      <section id="tab-sent" class="tab-panel is-hidden">
+        <h2>Отправленные</h2>
+        <p class="hint">Отметьте реакцию игрока и сохраните.</p>
+        <div id="sent-list" class="cards"></div>
+      </section>
+
+      <section id="tab-stats" class="tab-panel is-hidden">
+        <h2>Статистика</h2>
+        <div id="stats-panel" class="stats"></div>
+      </section>
+    </main>
+
+    <div id="token-gate" class="gate is-hidden" role="dialog" aria-modal="true" aria-labelledby="gate-title">
+      <div class="gate-card">
+        <h2 id="gate-title">Токен администратора</h2>
+        <p class="hint">Токен хранится только в этом браузере.</p>
+        <input id="token-input" type="password" autocomplete="off" placeholder="X-Admin-Token" />
+        <div class="gate-actions">
+          <button type="button" id="token-save" class="primary-button">Сохранить</button>
+          <button type="button" id="token-skip" class="ghost-button">Продолжить без токена</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast is-hidden" role="alert"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
