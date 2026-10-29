@@ -277,6 +277,18 @@ button {
   text-align: center;
 }
 
+.analytics-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.analytics-actions button {
+  width: 100%;
+  font-size: 0.9rem;
+}
+
 .stats {
   display: grid;
   grid-template-columns: 1fr 1fr;

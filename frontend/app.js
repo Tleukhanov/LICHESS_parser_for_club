@@ -466,6 +466,66 @@ async function loadStats() {
   }
 }
 
+/* ---------- Analytics ---------- */
+
+async function downloadDataset() {
+  // A plain <a href> cannot send X-Admin-Token, so fetch the CSV as a Blob.
+  const headers = new Headers();
+  const token = getToken();
+  if (token) headers.set("X-Admin-Token", token);
+
+  let response;
+  try {
+    response = await fetch("/api/analytics/export.csv", { headers });
+  } catch (error) {
+    throw new Error("Нет связи с сервером");
+  }
+
+  if (response.status === 401) {
+    openGate();
+    throw new Error("Неверный или отсутствующий токен");
+  }
+  if (!response.ok) {
+    throw new Error(await errorDetail(response));
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "dataset.csv";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function bindAnalyticsActions() {
+  const refreshBtn = $("refresh-joined");
+  const downloadBtn = $("download-csv");
+  const status = $("analytics-status");
+
+  refreshBtn.addEventListener("click", () =>
+    runAction(refreshBtn, async () => {
+      status.textContent = "Проверяем вступивших…";
+      const data = await api("/analytics/refresh", { method: "POST" });
+      status.textContent =
+        `Проверено: ${data.checked} · Новых: ${data.newly_joined} · ` +
+        `Всего вступили: ${data.total_joined}`;
+      showToast(`Новых вступивших: ${data.newly_joined}`);
+      await loadStats();
+    }),
+  );
+
+  downloadBtn.addEventListener("click", () =>
+    runAction(downloadBtn, async () => {
+      await downloadDataset();
+      status.textContent = "CSV скачан.";
+      showToast("CSV скачан");
+    }),
+  );
+}
+
 /* ---------- Tabs and token gate ---------- */
 
 function switchTab(name) {
@@ -503,6 +563,7 @@ function init() {
   $("token-skip").addEventListener("click", closeGate);
 
   bindParseForm();
+  bindAnalyticsActions();
 
   if (getToken()) {
     closeGate();

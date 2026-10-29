@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from backend.analytics.conversion import dataset_csv_bytes, refresh_joined
 from backend.api.deps import require_admin
 from backend.api.schemas import GenerateRequest, OutreachUpdate, ParseRequest
 from backend.config import settings
@@ -294,3 +295,27 @@ def send_outreach_now(
         "error": result.error,
         "outreach": repository.get_outreach(session, outreach_id) or {},
     }
+
+
+@router.post("/analytics/refresh")
+def refresh_analytics(session: SessionDep) -> dict[str, Any]:
+    """Check the configured team and mark candidates that have joined."""
+    api_session = build_session()
+    try:
+        return refresh_joined(session, session=api_session)
+    finally:
+        close = getattr(api_session, "close", None)
+        if callable(close):
+            close()
+
+
+@router.get("/analytics/export.csv")
+def export_analytics(session: SessionDep) -> Response:
+    """Download the outreach dataset as a CSV attachment."""
+    return Response(
+        content=dataset_csv_bytes(session),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="dataset.csv"',
+        },
+    )

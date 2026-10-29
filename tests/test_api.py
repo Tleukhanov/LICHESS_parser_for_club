@@ -11,6 +11,7 @@ import requests
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from backend.analytics import conversion
 from backend.api import routes
 from backend.config import settings
 from backend.db import database as database_module
@@ -395,3 +396,58 @@ def test_list_outreach_joins_candidate_data(
     assert rows[0]["bullet"] == 1500
 
     assert len(client.get("/api/outreach").json()) == 2
+
+
+def test_analytics_refresh_marks_team_members(
+    client: TestClient, db: Session, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "senpai_team_id", "senpai")
+
+    candidate_id = create_candidate(db, nick="Ivy")
+    outreach_id = create_outreach(db, candidate_id, "Hi")
+
+    api_session = FakeApiSession()
+    monkeypatch.setattr(routes, "build_session", lambda: api_session)
+    monkeypatch.setattr(
+        conversion, "fetch_team_members", lambda session, team: ["ivy"]
+    )
+
+    response = client.post("/api/analytics/refresh")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "team_id": "senpai",
+        "checked": 1,
+        "newly_joined": 1,
+        "total_joined": 1,
+    }
+    assert api_session.closed is True
+
+    row = get_outreach(db, outreach_id)
+    assert row["joined"] is True
+    assert row["joined_at"] is not None
+
+    second = client.post("/api/analytics/refresh")
+    assert second.status_code == 200
+    assert second.json()["newly_joined"] == 0
+
+
+def test_analytics_export_returns_csv_attachment(
+    client: TestClient, db: Session
+) -> None:
+    candidate_id = create_candidate(db, nick="zoe", rapid=1500)
+    outreach_id = create_outreach(db, candidate_id, "Hello")
+    update_outreach(db, outreach_id, send_status="sent")
+
+    response = client.get("/api/analytics/export.csv")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert (
+        response.headers["content-disposition"]
+        == 'attachment; filename="dataset.csv"'
+    )
+
+    lines = response.text.splitlines()
+    assert lines[0] == ",".join(conversion.DATASET_HEADER)
+    assert "zoe" in response.text
