@@ -198,7 +198,8 @@ def test_batch_sleeps_between_sends_but_not_before_the_first(
     )
 
     assert len(calls) == 2
-    assert sleeps == [2.5]
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(2.5, abs=0.1)
     assert result == {
         "sent": 2,
         "rejected": 0,
@@ -530,6 +531,77 @@ def test_batch_skips_joined_candidate_and_duplicate_rows(
     }
     assert statuses == {"sent", "rejected"}
     assert get_outreach(db_session, normal)["send_status"] == "sent"
+
+
+def test_batch_pacing_counts_a_previous_send(
+    db_session: Session, monkeypatch
+) -> None:
+    _make_outreach(
+        db_session,
+        "Recent",
+        send_status="sent",
+        sent_at=datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=5),
+    )
+    _approved_row(db_session, "Alice")
+    _fake_send(monkeypatch, SendResult(SendStatus.SENT))
+    sleeps: list[float] = []
+
+    queue.send_batch(
+        db_session,
+        session=object(),
+        sleep=sleeps.append,
+        interval=45,
+    )
+
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(40, abs=0.5)
+
+
+def test_candidate_in_sending_state_is_not_claimed_again(
+    db_session: Session, monkeypatch
+) -> None:
+    outreach_id = _approved_row(db_session, "Alice")
+    candidate_id = get_outreach(db_session, outreach_id)["candidate_id"]
+    db_session.execute(
+        update(candidates)
+        .where(candidates.c.id == candidate_id)
+        .values(
+            status="sending",
+            updated_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+    )
+    db_session.commit()
+    calls = _fake_send(monkeypatch, SendResult(SendStatus.SENT))
+
+    with pytest.raises(queue.SendRefused) as excinfo:
+        queue.send_outreach(db_session, outreach_id, session=object())
+
+    assert excinfo.value.reason == "in_progress"
+    assert calls == []
+
+
+def test_stale_sending_candidate_can_be_reclaimed(
+    db_session: Session, monkeypatch
+) -> None:
+    outreach_id = _approved_row(db_session, "Alice")
+    candidate_id = get_outreach(db_session, outreach_id)["candidate_id"]
+    db_session.execute(
+        update(candidates)
+        .where(candidates.c.id == candidate_id)
+        .values(
+            status="sending",
+            updated_at=datetime.now(UTC).replace(tzinfo=None)
+            - timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+    calls = _fake_send(monkeypatch, SendResult(SendStatus.SENT))
+
+    result = queue.send_outreach(db_session, outreach_id, session=object())
+
+    assert result.status is SendStatus.SENT
+    assert len(calls) == 1
+    assert get_candidate(db_session, candidate_id)["status"] == "messaged"
 
 
 def test_batch_resets_abandoned_sending_rows(

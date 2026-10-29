@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from backend.config import settings
@@ -65,6 +66,11 @@ COUNTER_FOR_RESULT = {
 
 #: ``app_state`` key holding the moment until which sending is paused after 429.
 COOLDOWN_KEY = "send_cooldown_until"
+
+#: Serializes sends inside one process. A single Uvicorn worker runs the web
+#: UI, so this closes the check-then-act window for double submits and for the
+#: daily cap. Cross-process protection comes from the DB-level claims below.
+_SEND_LOCK = threading.Lock()
 
 
 class SendRefused(Exception):
@@ -166,11 +172,79 @@ def _retry_after(until: datetime, now: datetime) -> int:
 
 
 def _mark_candidate_messaged(db_session: Session, candidate_id: int) -> None:
+    # Never downgrade a candidate that joined while the HTTP request was in
+    # flight: `joined` is stronger than `messaged`.
     db_session.execute(
         update(candidates)
-        .where(candidates.c.id == candidate_id)
+        .where(
+            candidates.c.id == candidate_id,
+            candidates.c.status != "joined",
+        )
         .values(status="messaged", updated_at=_utcnow())
     )
+
+
+def _claim_candidate(db_session: Session, candidate_id: int, now: datetime) -> bool:
+    """Atomically claim a candidate so only one worker can message them.
+
+    A stale ``sending`` candidate (a worker crashed mid-send) is reclaimable
+    after ``STALE_SENDING_SECONDS``.
+    """
+    cutoff = now - timedelta(seconds=settings.stale_sending_seconds)
+    result = db_session.execute(
+        update(candidates)
+        .where(
+            candidates.c.id == candidate_id,
+            ~candidates.c.status.in_(("joined", "messaged")),
+            or_(
+                candidates.c.status != "sending",
+                candidates.c.updated_at < cutoff,
+            ),
+        )
+        .values(status="sending", updated_at=now)
+    )
+    db_session.commit()
+    return result.rowcount == 1
+
+
+def _release_candidate(
+    db_session: Session,
+    candidate_id: int,
+    previous_status: str,
+    now: datetime,
+) -> None:
+    """Release a candidate claim after a non-successful send."""
+    status = (
+        previous_status
+        if previous_status not in {"sending", "joined", "messaged"}
+        else "new"
+    )
+    db_session.execute(
+        update(candidates)
+        .where(
+            candidates.c.id == candidate_id,
+            candidates.c.status == "sending",
+        )
+        .values(status=status, updated_at=now)
+    )
+    db_session.commit()
+
+
+def _wait_for_pacing(
+    db_session: Session,
+    now: datetime,
+    interval: float,
+    sleep: Callable[[float], None],
+) -> None:
+    """Sleep until ``SEND_INTERVAL_SECONDS`` has passed since the last send."""
+    if interval <= 0:
+        return
+    last = latest_sent_at(db_session)
+    if last is None:
+        return
+    wait = interval - (now - last).total_seconds()
+    if wait > 0:
+        sleep(wait)
 
 
 def send_outreach(
@@ -183,10 +257,33 @@ def send_outreach(
 ) -> SendResult:
     """Send one approved outreach message and persist the outcome.
 
-    Raises :class:`SendRefused` when a safety guard blocks the send and
-    :class:`ValueError` when the row is missing or not approved. An already
+    All send paths (web UI, ``--outreach-id`` and ``--batch``) go through this
+    function. Raises :class:`SendRefused` when a safety guard blocks the send
+    and :class:`ValueError` when the row is missing or not approved. An already
     sent row is a no-op so the function is safe to retry.
     """
+    with _SEND_LOCK:
+        return _send_outreach_locked(
+            db_session,
+            outreach_id,
+            session=session,
+            now=now,
+            enforce_pacing=enforce_pacing,
+        )
+
+
+def _send_outreach_locked(
+    db_session: Session,
+    outreach_id: int,
+    *,
+    session: Any | None,
+    now: datetime | None,
+    enforce_pacing: bool,
+) -> SendResult:
+    moment = _to_naive_utc(now) if now is not None else _utcnow()
+    # Recover rows abandoned by a crashed worker before inspecting this one.
+    _reset_stale_sending(db_session, moment)
+
     row = get_outreach(db_session, outreach_id)
     if row is None:
         raise ValueError(f"outreach {outreach_id} not found")
@@ -202,9 +299,8 @@ def send_outreach(
     if candidate is None:
         raise ValueError(f"candidate {row['candidate_id']} not found")
 
-    moment = _to_naive_utc(now) if now is not None else _utcnow()
-
-    if candidate["status"] == "joined":
+    previous_status = candidate["status"]
+    if previous_status == "joined":
         update_outreach(
             db_session,
             outreach_id,
@@ -212,6 +308,14 @@ def send_outreach(
             send_error="candidate already joined the club",
         )
         raise SendRefused("joined")
+    if previous_status == "messaged":
+        update_outreach(
+            db_session,
+            outreach_id,
+            send_status="rejected",
+            send_error="candidate already messaged",
+        )
+        raise SendRefused("already_sent")
 
     text = (row["message_text"] or "").strip()
     if not text:
@@ -251,13 +355,23 @@ def send_outreach(
         api_session = build_session()
 
     try:
+        # DB-level candidate claim: only one worker may message this nick, even
+        # when two approved outreach rows exist or the UI and CLI run together.
+        if not _claim_candidate(db_session, candidate["id"], moment):
+            raise SendRefused("in_progress")
         if not _claim(db_session, outreach_id, moment):
+            _release_candidate(
+                db_session, candidate["id"], previous_status, moment
+            )
             raise SendRefused("in_progress")
         try:
             result = send_message(api_session, candidate["nick"], text)
         except Exception as exc:  # defensive: send_message maps HTTP errors itself
             update_outreach(
                 db_session, outreach_id, send_status="failed", send_error=str(exc)
+            )
+            _release_candidate(
+                db_session, candidate["id"], previous_status, moment
             )
             raise
     finally:
@@ -274,16 +388,19 @@ def send_outreach(
             send_error=None,
             sent_at=moment,
         )
-        if candidate["status"] != "joined":
-            _mark_candidate_messaged(db_session, row["candidate_id"])
-            db_session.commit()
+        _mark_candidate_messaged(db_session, candidate["id"])
+        db_session.commit()
     else:
-        # Rejected, rate limited and hard errors leave the approved queue.
+        # Rejected, rate limited and hard errors leave the approved queue and
+        # release the candidate so a human can retry explicitly.
         update_outreach(
             db_session,
             outreach_id,
             send_status=STATUS_FOR_RESULT[result.status],
             send_error=result.error,
+        )
+        _release_candidate(
+            db_session, candidate["id"], previous_status, moment
         )
         if result.status is SendStatus.RATE_LIMITED:
             _set_cooldown(
@@ -308,9 +425,11 @@ def send_batch(
 
     The daily cap and the 429 cooldown are checked before the batch starts and
     again by :func:`send_outreach` for every message. Only one outreach row per
-    candidate is ever attempted.
+    candidate is ever attempted. Pacing is measured from the *actual* last send
+    (including a UI send made before the batch), not from the batch start.
     """
-    moment = _to_naive_utc(now) if now is not None else _utcnow()
+    clock = (lambda: _to_naive_utc(now)) if now is not None else _utcnow
+    moment = clock()
     _reset_stale_sending(db_session, moment)
 
     counters: dict[str, Any] = {
@@ -382,22 +501,28 @@ def send_batch(
     selected = selected[:effective_limit]
 
     pause = interval if interval is not None else settings.send_interval_seconds
-    for index, outreach_id in enumerate(selected):
-        if index > 0:
-            sleep(pause)
+    for outreach_id in selected:
+        current = clock()
+        _wait_for_pacing(db_session, current, pause, sleep)
+        current = clock()
 
         try:
             result = send_outreach(
                 db_session,
                 outreach_id,
                 session=session,
-                now=moment,
+                now=current,
                 enforce_pacing=False,
             )
         except SendRefused as exc:
             if exc.reason in {"daily_limit", "cooldown", "too_soon"}:
                 counters["stopped"] = exc.reason
                 break
+            counters["failed"] += 1
+            continue
+        except ValueError:
+            # The row was rejected/changed by a human between selection and
+            # send. Skip it instead of aborting the whole batch.
             counters["failed"] += 1
             continue
 

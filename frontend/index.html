@@ -64,8 +64,17 @@
       </section>
 
       <section id="tab-sent" class="tab-panel is-hidden">
-        <h2>Отправленные</h2>
+        <h2>Отправленные и ошибки</h2>
         <p class="hint">Отметьте реакцию игрока и сохраните.</p>
+        <label class="field">Фильтр
+          <select id="sent-filter">
+            <option value="sent">Отправлено</option>
+            <option value="skipped_400">Отклонено Lichess</option>
+            <option value="skipped_429">Лимит Lichess</option>
+            <option value="failed">Ошибки</option>
+            <option value="">Все</option>
+          </select>
+        </label>
         <div id="sent-list" class="cards"></div>
       </section>
 

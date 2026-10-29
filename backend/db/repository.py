@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.db.models import app_state, candidates, outreach
@@ -139,16 +140,30 @@ def get_state(session: Session, key: str) -> str | None:
 
 
 def set_state(session: Session, key: str, value: str | None) -> None:
-    """Insert or update a key in the ``app_state`` store."""
+    """Insert or update a key in the ``app_state`` store.
+
+    The insert path tolerates a concurrent insert of the same key: another
+    worker may have created the row between our ``UPDATE`` and ``INSERT``.
+    """
     updated = session.execute(
         update(app_state)
         .where(app_state.c.key == key)
         .values(value=value, updated_at=_utcnow())
     )
     if updated.rowcount == 0:
-        session.execute(
-            insert(app_state).values(key=key, value=value, updated_at=_utcnow())
-        )
+        try:
+            session.execute(
+                insert(app_state).values(key=key, value=value, updated_at=_utcnow())
+            )
+            session.commit()
+            return
+        except IntegrityError:
+            session.rollback()
+            session.execute(
+                update(app_state)
+                .where(app_state.c.key == key)
+                .values(value=value, updated_at=_utcnow())
+            )
     session.commit()
 
 

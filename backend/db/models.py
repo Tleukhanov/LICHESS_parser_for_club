@@ -18,7 +18,14 @@ from sqlalchemy import (
 metadata = MetaData()
 
 # Allowed values for the status-like columns. Enforced by the application layer.
-CANDIDATE_STATUSES = {"new", "selected", "messaged", "joined", "skipped"}
+CANDIDATE_STATUSES = {
+    "new",
+    "selected",
+    "sending",
+    "messaged",
+    "joined",
+    "skipped",
+}
 SEND_STATUSES = {
     "draft",
     "approved",

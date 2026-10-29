@@ -212,12 +212,21 @@ Safety rules enforced before any HTTP request:
 - a second message to the same player is refused (only one successful DM per nick);
 - a candidate already marked `joined` is skipped (`skipped_joined`);
 - empty message text is refused;
-- a row is atomically claimed (`approved` → `sending`) before the request, so a double
-  submit cannot send the same DM twice; `sent` rows are immutable history.
+- the candidate and the outreach row are atomically claimed in the database
+  (`candidate.status` and `outreach.send_status` → `sending`) before the request, so
+  two approved rows for the same nick, a double submit, or the UI racing a CLI batch
+  cannot send the same DM twice; `sent` rows are immutable history;
+- pacing in a batch is measured from the actual last send, including a UI send made
+  just before the batch started.
 
 Only `approved` rows are selected by a batch. `approve`/`reject` refuse to move a
 `sent` row, and `PATCH` refuses to change the text of a sent message (reactions and
 reviewer fields are still editable).
+
+Operational note: the daily counter is checked under an in-process lock; the DB claims
+prevent duplicate DMs across processes, but two separate senders (for example the web
+UI and a `heroku run ... --batch` at the same time) could still exceed the daily cap by
+a message or two. Run one sender at a time.
 
 ## Human review workflow
 
@@ -278,7 +287,7 @@ layer. `app_state` is a tiny key/value store used for the `429` cooldown.
 | `rapid`, `blitz`, `bullet` | integer, nullable | Ratings; `null` when the player has none. |
 | `games_total` | integer | Total rated games. |
 | `last_seen` | bigint, nullable | Lichess "seen at" timestamp. |
-| `status` | string(20) | `new`, `selected`, `messaged`, `joined`, `skipped` (default `new`). |
+| `status` | string(20) | `new`, `selected`, `sending` (transient claim), `messaged`, `joined`, `skipped` (default `new`). |
 | `created_at`, `updated_at` | datetime | |
 
 Re-parsing a club updates ratings and `last_seen` but leaves `status` untouched.

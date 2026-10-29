@@ -401,6 +401,11 @@ function sentCard(row) {
     card.append(el("p", "error-text", row.send_error));
   }
 
+  // A reaction only makes sense for a message that was actually delivered.
+  if (row.send_status !== "sent") {
+    return card;
+  }
+
   const reactionLabel = el("label", "", "Реакция");
   const reaction = document.createElement("select");
   Object.entries(REACTION_LABELS).forEach(([value, label]) => addOption(reaction, value, label));
@@ -428,7 +433,9 @@ async function loadSent() {
   const list = $("sent-list");
   list.replaceChildren(el("p", "empty", "Загрузка…"));
   try {
-    const rows = await api("/outreach?send_status=sent");
+    const filter = $("sent-filter") ? $("sent-filter").value : "sent";
+    const query = filter ? `?send_status=${encodeURIComponent(filter)}` : "";
+    const rows = await api(`/outreach${query}`);
     // Newest first is more useful on a phone.
     rows.reverse();
     if (rows.length === 0) {
@@ -584,6 +591,8 @@ function init() {
 
   bindParseForm();
   bindAnalyticsActions();
+  const sentFilter = $("sent-filter");
+  if (sentFilter) sentFilter.addEventListener("change", loadSent);
 
   if (getToken()) {
     closeGate();
