@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_model: str = "openai/gpt-4o-mini"
+    llm_temperature: float = 0.7
+    llm_max_tokens: int = 400
+    llm_timeout: int = 60
+    message_language: str = "ru"
+    club_url: str = ""
 
     database_url: str = "sqlite:///./data/outreach.db"
 
