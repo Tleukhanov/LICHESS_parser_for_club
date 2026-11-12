@@ -395,3 +395,8 @@ The test suite (`tests/`) covers the Lichess transport and messaging mapping, th
 parser filters/ranking, LLM prompt building and retry logic, the sender queue and the
 API, and never touches the network: HTTP sessions are faked. The same two commands run
 in GitHub Actions on every push and pull request (`.github/workflows/ci.yml`).
+
+---
+
+**Build. Learn. Understand.**
+© Ералы Тлеуханов · [tleukhanov.me](https://tleukhanov.me)
